@@ -6,24 +6,64 @@ use std::fs::read_to_string;
 use std::fs::File;
 use std::io::Read;
 use std::iter::once;
+use std::process::exit;
 use std::ptr;
 use std::rc::Rc;
 
-/* A token and its line */
-type TokenData = (Token /* Token */, u16 /* Line */);
+type TokenData /* Token Data (token and line) type */ =
+    (Token /* Token */, u16 /* Line */);
 
-/* Function type */
-type Fun = (
+type Fun /* Function type */ = (
     Rc<[TokenData]>, /* (Token, Line)s */
     bool,            /* Inline descriptor */
 );
 
-/* Binary VM application */
-type BinApp = fn(MaeelType /* LHS */, MaeelType /* RHS */) -> MaeelType;
+type BinApp /* Binary VM application */ =
+    fn(MaeelType /* LHS */, MaeelType /* RHS */) -> MaeelType;
 
-/* Default VM function output */
-type VMOutput<T> = Result<T, Box<dyn Error>>;
+type VMOutput<T> /* Default VM function output */ = Result<T, Box<dyn Error>>;
 
+macro_rules! expect_token {
+    ($token:tt, $tokens:expr, $line:expr) => {{
+        match $tokens.pop() {
+            Some((Token::$token(value), _)) => value,
+            Some((other, other_line)) => {
+                emit_error!(
+                    other_line,
+                    format!("Expected {:?}, got {other:?}", TokenRepr::$token)
+                )
+            }
+            None => emit_error!($line, format!("Expected {:?}, got EOF", TokenRepr::$token)),
+        }
+    }};
+}
+
+macro_rules! expect_stack {
+    ($tpe:tt, $stack:expr, $line:expr) => {{
+        match $stack.pop() {
+            Ok(MaeelType::$tpe(value)) => value,
+            Ok(other) => {
+                emit_error!(
+                    $line,
+                    format!(
+                        "Expected {:?} on the stack, got {other:?}",
+                        MaeelTypeRepr::$tpe
+                    )
+                )
+            }
+            Err(_) => emit_error!(
+                $line,
+                format!("Expected {:?}, got EOF", MaeelTypeRepr::$tpe)
+            ),
+        }
+    }};
+}
+macro_rules! emit_error {
+    ($line:expr, $message:expr) => {{
+        println!("{}: {}", $line, $message);
+        exit(1);
+    }};
+}
 /* Build an empty hashmap (1) */
 macro_rules! empty_hashmap {
     () => {
@@ -86,10 +126,21 @@ enum MaeelType {
     Structure(HashMap<String, Self>), /* Custom type for a structure */
 }
 
+#[derive(Debug)]
+#[allow(unused)]
+enum MaeelTypeRepr {
+    Float,     /* Float type */
+    Integer,   /* Integer type */
+    String,    /* String type */
+    Array,     /* Array of basic types */
+    Function,  /* Custom type for a function (using functions as objects) */
+    Structure, /* Custom type for a structure */
+}
+
 #[derive(Clone, Debug /* For error messages */)]
 enum Token {
     Block(Vec<TokenData>), /* (...) */
-    String(String),        /* "abc" */
+    String(String),        /* "abc"*/
     Identifier(String),    /* abc */
     Integer(i32),          /* 123 */
     Float(f32),            /* 123.123 */
@@ -103,6 +154,26 @@ enum Token {
     ArrayEnd,              /* } */
     BlockStart,            /* ( */
     BlockEnd,              /* ) */
+}
+
+#[derive(Debug)]
+#[allow(unused)]
+enum TokenRepr {
+    Block,      /* (...) */
+    String,     /* "abc"*/
+    Identifier, /* abc */
+    Integer,    /* 123 */
+    Float,      /* 123.123 */
+    BinaryOP,   /* T x T -> T */
+    Colon,      /* : */
+    Dot,        /* . */
+    Call,       /* &, ! */
+    Assignment, /* -> */
+    Then,       /* => */
+    ArrayStart, /* { */
+    ArrayEnd,   /* } */
+    BlockStart, /* ( */
+    BlockEnd,   /* ) */
 }
 
 /* A Node on the stack */
@@ -144,13 +215,13 @@ impl BocchiVM {
         self.push(output /* Push the output */)
     }
 
+    /// Parse an array and its content
     fn parse_array(
         &mut self,
         tokens: &mut Vec<TokenData>,
         vars: &mut HashMap<String, MaeelType>,
     ) -> VMOutput<()> {
-        /* Array content */
-        let mut xs = empty_vec!();
+        let mut xs /* Array content */ = empty_vec!();
 
         while let Some(temporary_token_data) = tokens.pop() {
             let (temporary_token, temporary_line) =
@@ -167,7 +238,6 @@ impl BocchiVM {
                 /* Parse an array inside an array (recursive) */
                 {
                     self.parse_array(tokens, vars)?;
-
                     xs.push(self.pop()?);
                 }
 
@@ -179,11 +249,11 @@ impl BocchiVM {
                     Some(value) => xs.push(value.clone()),
 
                     _ => {
-                        panic!("{temporary_line}: unknown identifier found while parsing array: {identifier} (maybe store it inside a variable ?)")
+                        emit_error!(temporary_line, format!("unknown identifier found while parsing array: {identifier} (maybe store it inside a variable ?)"))
                     }
                 },
 
-                _ => panic!("{temporary_line}: unknown token found while parsing array"),
+                _ => emit_error!(temporary_line, "unknown token found while parsing array"),
             }
         }
 
@@ -204,13 +274,13 @@ impl BocchiVM {
         tokens.reverse();
 
         while let Some(token_data) = tokens.pop() {
-            let (token, line) = (token_data.0, token_data.1);
+            let (token, line) = (token_data.0 /* Token */, token_data.1 /* Line */);
 
             match token {
                 Token::BlockStart | Token::BlockEnd | Token::ArrayEnd =>
                 /* Should not be there... */
                 {
-                    panic!("{line}: syntax error")
+                    emit_error!(line, "syntax error")
                 }
 
                 Token::ArrayStart =>
@@ -232,57 +302,44 @@ impl BocchiVM {
                 Token::Dot =>
                 /* Access structures members */
                 {
-                    match self.pop() {
-                        Ok(MaeelType::Structure(structure)) => {
-                            let structure_member = structure.get(&match tokens.pop() {
-                            Some((Token::Identifier(value), _)) => value,
-                            Some((other, other_line)) => {
-                                panic!("{other_line}: expected an identifier after dot; got {other:?} instead.")
-                            }
-                            None => panic!("{line}: expected an identifier after dot!"),
-                        });
+                    let structure_member_name = expect_token!(Identifier, tokens, line);
 
-                            if let Some(MaeelType::Function(fun)) = structure_member {
-                                if fun.1
-                                /* Inline function */
-                                {
-                                    /* We just push functions tokens on
-                                    the current tokens stack and continue */
-                                    fun.0.iter().for_each(|token| tokens.push(token.clone()));
-                                } else {
-                                    /* We create a new stack (functions, variables and structures are shared) */
-                                    self.process_tokens(
-                                        &mut fun.0.to_vec(), /* Function tokens */
-                                        &mut vars.clone(),   /* Clone the variables */
-                                        funs,
-                                        structs,
-                                    )?
-                                }
+                    let structure = expect_stack!(Structure, self, line);
+                    let structure_member = structure.get(&structure_member_name);
 
-                                continue;
-                            }
-
-                            self.push(structure_member.unwrap().clone())?
+                    if let Some(MaeelType::Function(fun)) = structure_member {
+                        if fun.1
+                        /* Inline function */
+                        {
+                            /* We just push f@unctions tokens on
+                            the current tokens stack and continue */
+                            fun.0.iter().for_each(|token| tokens.push(token.clone()));
+                        } else {
+                            /* We create a new stack (functions, variables and structures are shared) */
+                            self.process_tokens(
+                                &mut fun.0.to_vec(), /* Function tokens */
+                                &mut vars.clone(),   /* Clone the variables */
+                                funs,
+                                structs,
+                            )?
                         }
 
-                        other => panic!(
-                        "{line}: found a 'dot' but no structure on the stack; got {other:?} instead"
-                    ),
+                        continue;
                     }
+
+                    self.push(structure_member.unwrap().clone())?
                 }
 
                 Token::Colon =>
                 /* Use functions as first class objects */
                 {
                     /* Function name */
-                    let fun_name = match tokens.pop() {
-                        Some((Token::Identifier(value), _)) => value,
-                        Some((other, other_line)) => panic!("{other_line}: every colon must be followed by a function name; got {other:?} instead"),
-                        None => panic!("{line}: every colon must be followed by a function name."),
-                    };
+                    let fun_name = expect_token!(Identifier, tokens, line);
 
                     /* Function object */
-                    let fun = funs.get(&fun_name).unwrap();
+                    let fun = funs.get(&fun_name).unwrap_or_else(|| {
+                        emit_error!(line, format!("unknown function: {fun_name:?}"))
+                    });
 
                     /* Push the function codeblock */
                     self.push(MaeelType::Function((
@@ -295,10 +352,7 @@ impl BocchiVM {
                 /* Manually call a function */
                 {
                     /* Function object */
-                    let fun = match self.pop() {
-                        Ok(MaeelType::Function(value)) => value,
-                        _ => panic!("{line}: tried to call something else than a function!"),
-                    };
+                    let fun = expect_stack!(Function, self, line);
 
                     if fun.1
                     /* Inline function */
@@ -329,23 +383,21 @@ impl BocchiVM {
                                 .rev()
                                 .for_each(|token| tokens.push(token.clone())),
                             Some(temporary_token) => tokens.push(temporary_token),
-                            None => panic!("{line}: expected something after '=>'"),
+                            None => emit_error!(line, "expected something after '=>'"),
                         },
                         Ok(False!()) => { /* Do nothing */ }
-                        Ok(other) => panic!("{line}: '=>' expects a boolean (0 or 1) on the stack; got {other:?} instead."),
-                        Err(_) => panic!("{line}: '=>' expects a boolean (0 or 1) on the stack.")
+                        Ok(other) => emit_error!(
+                            line,
+                            format!("'=>' expects a boolean (0 or 1) on the stack; got {other:?} instead.")
+                        ),
+                        Err(_) => emit_error!(line, "'=>' expects a boolean (0 or 1) on the stack."),
                     }
                 }
 
                 Token::Assignment =>
                 /* MaeelType <-> identifier */
                 {
-                    let name = match tokens.pop() {
-                        Some((Token::Identifier(value), _)) => value,
-                        Some((other, other_line)) => panic!("{other_line}: expected an identifier after '->'; got {other:?} instead."),
-                        None => panic!("{line}: expected an identifier after '->'."),
-                    };
-
+                    let name = expect_token!(Identifier, tokens, line);
                     vars.insert(name, self.pop()?);
                 }
 
@@ -360,65 +412,66 @@ impl BocchiVM {
                         }
 
                         "break" =>
-                        /* Stop processing the tokens */
+                        /* Stop processing the tokens
+                        Can be used inside of a function, a for loop etc.
+                        But should only be used inside of loops IMO.
+
+                        TODO: rebuild this */
                         {
                             break
-                        } /* TODO: rebuild this */
+                        }
 
                         "clear" =>
                         /* Process "clear" VM operation */
                         {
                             self.clear()
-                                .unwrap_or_else(|_| panic!("{line}: failed to clear stack!"))
+                                .unwrap_or_else(|_| emit_error!(line, "failed to clear stack!"))
                         }
 
                         "drop" =>
                         /* Process "fastpop" VM operation */
                         {
-                            self.fastpop()
-                                .unwrap_or_else(|_| panic!("{line}: failed to drop"))
+                            self.fastpop().unwrap_or_else(|_| {
+                                emit_error!(line, "failed to drop (need at least 1 element)")
+                            })
                         }
 
                         "dup" =>
                         /* Process "dup" VM operation */
                         {
-                            self.dup()
-                                .unwrap_or_else(|_| panic!("{line}: failed to dup"))
+                            self.dup().unwrap_or_else(|_| {
+                                emit_error!(line, "failed to dup (need at least 1 element)")
+                            })
                         }
 
                         "swap" =>
                         /* Process "swap" VM operation */
                         {
-                            self.swap()
-                                .unwrap_or_else(|_| panic!("{line}: failed to swap"))
+                            self.swap().unwrap_or_else(|_| {
+                                emit_error!(line, "failed to swap (need at least 2 elements)")
+                            })
                         }
 
                         "over" =>
                         /* Process "over" VM operation */
                         {
-                            self.over()
-                                .unwrap_or_else(|_| panic!("{line}: failed to over"))
+                            self.over().unwrap_or_else(|_| {
+                                emit_error!(line, "failed to over (need at least 2 elements)")
+                            })
                         }
 
                         "rot" =>
                         /* Process "rotate" VM operation */
                         {
-                            self.rot()
-                                .unwrap_or_else(|_| panic!("{line}: failed to rotate"))
+                            self.rot().unwrap_or_else(|_| {
+                                emit_error!(line, "failed to rotate (need at least 3 elements)")
+                            })
                         }
 
                         /* For loop implementation */
                         "for" => {
                             /* Code block to execute at each iteration */
-                            let temporary_tokens = match tokens.pop() {
-                                Some((Token::Block(value), _)) => value,
-                                Some((other, other_line)) => {
-                                    panic!("{other_line}: expected a code block after 'for'; got {other:?} instead.")
-                                }
-                                None => {
-                                    panic!("{line}: expected a code block after 'for'!")
-                                }
-                            };
+                            let temporary_tokens = expect_token!(Block, tokens, line);
 
                             /* Determine what to iterate through */
                             match self.pop() {
@@ -460,23 +513,9 @@ impl BocchiVM {
 
                         /* While loop implementation */
                         "while" => {
-                            /* Code block to execute at each iteration */
-                            let temporary_tokens = match tokens.pop() {
-                                Some((Token::Block(value), _)) => value,
-                                Some((other, other_line)) => {
-                                    panic!("{other_line}: expected a code block after 'while'; got {other:?} instead.")
-                                }
-                                None => {
-                                    panic!("{line}: expected a code block after 'while'!")
-                                }
-                            };
+                            let temporary_tokens = expect_token!(Block, tokens, line);
 
-                            /* Determine if we continue looping or not */
-                            while match self.pop() {
-                                Ok(True!()) => true,                             /* Continue looping */
-                                Ok(False!()) => false,                           /* Stop looping */
-                                _ => panic!("{line}: no boolean on the stack!"), /* No boolean on the stack */
-                            } {
+                            while expect_stack!(Integer, self, line) == 1 {
                                 self.process_tokens(
                                     &mut temporary_tokens.clone(),
                                     vars,
@@ -487,61 +526,41 @@ impl BocchiVM {
                         }
 
                         "struct" => {
-                            let struct_name = match tokens.pop() {
-                                Some((Token::Identifier(value), _)) => value,
-                                Some((other, other_line)) => panic!("{other_line}: expected identifier after 'struct'; got {other:?} instead."),
-                                _ => panic!("{line}: expected identifier after 'struct'."),
-                            };
+                            let struct_name = expect_token!(Identifier, tokens, line);
 
                             /* Structure attributes */
                             let mut struct_fields = empty_vec!();
 
                             while let Some(temporary_tokens) = tokens.pop() {
                                 match temporary_tokens {
-                                (Token::Dot, _) =>
-                                /* Stop parsing structure fields on '.' */
-                                {
-                                    break;
-                                }
+                                    (Token::Dot, _) =>
+                                        /* Stop parsing structure fields on '.' */
+                                    {
+                                        break;
+                                    }
 
-                                (Token::Identifier(identifier), _) => {
-                                    struct_fields.push(identifier);
-                                }
+                                    (Token::Identifier(identifier), _) => {
+                                        struct_fields.push(identifier);
+                                    }
 
-                                (other, other_line) => panic!("{other_line}: expected identifier(s) or dot after 'struct {struct_name}'; got {other:?} instead."),
-                            }
+                                    (other, other_line) => emit_error!(
+                                        other_line,
+                                        format!("expected identifier(s) or dot after 'struct {struct_name}'; got {other:?} instead.")
+                                    )
+                                }
                             }
 
                             struct_fields.reverse();
-
                             structs.insert(struct_name, struct_fields.as_slice().into());
                         }
 
                         "fun" => {
-                            let mut fun_name = match tokens.pop() {
-                                Some((Token::Identifier(value), _)) => value,
-                                Some((other, other_line)) => {
-                                    panic!("{other_line}: expected an identifier after 'fun'; got {other:?} instead.")
-                                }
-                                None => {
-                                    panic!("{line}: expected an identifier after 'fun'.")
-                                }
-                            };
-
+                            let mut fun_name = expect_token!(Identifier, tokens, line);
                             let mut is_inline = false;
 
                             if fun_name == "inline" {
                                 is_inline = true;
-
-                                fun_name = match tokens.pop() {
-                                    Some((Token::Identifier(value), _)) => value,
-                                    Some((other, other_line)) => {
-                                        panic!("{other_line}: expected an identifier after 'fun inline'; got {other:?} instead.")
-                                    }
-                                    None => {
-                                        panic!("{line}: expected an identifier after 'fun inline'.")
-                                    }
-                                }
+                                fun_name = expect_token!(Identifier, tokens, line);
                             }
 
                             let mut fun_tokens = empty_vec!(); /* Final tokens */
@@ -562,7 +581,7 @@ impl BocchiVM {
                                     }
 
                                     (other, other_line) => {
-                                        panic!("{other_line}: expected identifier(s) or a code block after 'fun {fun_name}'; got {other:?} instead.")
+                                        emit_error!(other_line, format!("expected identifier(s) or a code block after 'fun {fun_name}'; got {other:?} instead."))
                                     }
                                 }
                             }
@@ -574,38 +593,36 @@ impl BocchiVM {
                         }
 
                         "get" => {
-                            let index = match self.pop() {
-                                Ok(MaeelType::Integer(value)) => value as usize,
-                                _ => panic!(),
-                            };
+                            let index = expect_stack!(Integer, self, line) as usize;
 
                             match self.pop() {
-                                Ok(MaeelType::Array(xs)) => {
-                                    self.push(xs.get(index).unwrap().clone())
-                                }
+                                Ok(MaeelType::Array(xs)) => self.push(
+                                    xs.get(index)
+                                        .unwrap_or_else(|| {
+                                            emit_error!(line, format!("unknown index: {index}"))
+                                        })
+                                        .clone(),
+                                ),
 
                                 Ok(MaeelType::String(string)) => self.push(MaeelType::String(
-                                    string.chars().nth(index).unwrap().to_string(),
+                                    string
+                                        .chars()
+                                        .nth(index)
+                                        .unwrap_or_else(|| {
+                                            emit_error!(line, format!("unknown index: {index}"))
+                                        })
+                                        .to_string(),
                                 )),
 
-                                Ok(other) => panic!("{other} is not indexable!"),
+                                Ok(other) => emit_error!(line, format!("unindexable: {other:?}")),
 
-                                _ => panic!("Nothing to index!"),
+                                _ => emit_error!(line, format!("unindexable: EOF")),
                             }?
                         }
 
                         "read" => {
-                            let bytes = match self.pop() {
-                                Ok(MaeelType::Integer(value)) => value,
-
-                                _ => panic!(),
-                            };
-
-                            let path = match self.pop() {
-                                Ok(MaeelType::String(value)) => value,
-
-                                _ => panic!(),
-                            };
+                            let bytes = expect_stack!(Integer, self, line);
+                            let path = expect_stack!(String, self, line);
 
                             assert!(bytes >= 0);
 
@@ -613,26 +630,25 @@ impl BocchiVM {
 
                             File::open(path)?.read_exact(&mut buf)?; /* file content -> buffer */
 
-                            self.push(MaeelType::Array(
-                                buf.iter()
-                                    .map(|byte| MaeelType::Integer(*byte as i32))
-                                    .collect(),
-                            ))?
+                            let content_bytes = buf
+                                .iter()
+                                .map(|byte| MaeelType::Integer(*byte as i32))
+                                .collect();
+
+                            self.push(MaeelType::Array(content_bytes))?
                         }
 
                         "include" => {
-                            let target = match self.pop() {
-                                Ok(MaeelType::String(value)) => value,
-                                _ => panic!(),
-                            };
+                            let target = expect_stack!(String, self, line);
 
                             let content = match target.as_str() {
                                 /* Standard library is included at compile time. We prefer memory
                                 usage over CPU usage... */
                                 "std" => include_str!("../stdlib/std.maeel").to_string(),
 
-                                _ => read_to_string(target)
-                                    .unwrap_or_else(|_| panic!("{line}: failed to include file")),
+                                _ => read_to_string(target).unwrap_or_else(|_| {
+                                    emit_error!(line, "failed to include file")
+                                }),
                             };
 
                             lex_into_tokens(&content)
@@ -664,6 +680,7 @@ impl BocchiVM {
                                 reverse() later */
                                 let mut fun_tokens = fun.0.clone().to_vec();
 
+                                /* ...here lol */
                                 fun_tokens.reverse();
 
                                 self.process_tokens(
@@ -693,7 +710,7 @@ impl BocchiVM {
                                 continue;
                             }
 
-                            panic!("{line}: unknown identifier {identifier}")
+                            emit_error!(line, format!("unknown identifier {identifier}"))
                         }
                     }
                 }
@@ -815,17 +832,17 @@ impl BocchiVM {
         }
 
         unsafe {
-            let node1 /* Top node */ = &mut *self.head;
-            let node2 /* Mid node */ = &mut *(*self.head).next;
-            let node3 /* Bot node */ = &mut *(*(*self.head).next).next;
+            let top = &mut *self.head;
+            let mid = &mut *(*self.head).next;
+            let bot = &mut *(*(*self.head).next).next;
 
-            /* Store the node1 value in a temp variable,
+            /* Store the top value in a temp variable,
             as we update its value first */
-            let temp = ptr::read(&node1.value);
+            let temp = ptr::read(&top.value);
 
-            ptr::swap /* V(top) <- V(mid) */ (&mut node1.value, &mut node2.value);
-            ptr::swap /* V(mid) <- V(bot) */ (&mut node2.value, &mut node3.value);
-            ptr::write /* V(bot) <- V(top) */ (&mut node3.value, temp);
+            ptr::swap /* V(top) <- V(mid) */ (&mut top.value, &mut mid.value);
+            ptr::swap /* V(mid) <- V(bot) */ (&mut mid.value, &mut bot.value);
+            ptr::write /* V(bot) <- V(top) */ (&mut bot.value, temp);
         }
 
         Ok(())
@@ -881,6 +898,8 @@ impl std::fmt::Display for MaeelType {
         }
     }
 }
+
+/// Perform lexical parsing over code.
 fn lex_into_tokens(code: &str) -> Vec<TokenData> {
     let mut depth = 0;
     let mut line = 1;
@@ -953,7 +972,7 @@ fn lex_into_tokens(code: &str) -> Vec<TokenData> {
                         }
 
                         ('\\', None) => {
-                            panic!("{line}: incomplete escape sequence")
+                            emit_error!(line, "incomplete escape sequence")
                         }
 
                         _ => character,
@@ -990,23 +1009,25 @@ fn lex_into_tokens(code: &str) -> Vec<TokenData> {
             }
 
             /* Parse equal/then */
-            '=' => match characters.peek() {
+            '=' => match characters.peek()
+            /* Just using peek() because of the _ case */
+            {
                 Some('>') =>
-                /* Then */
+                /* Then (=>) */
                 {
                     tokens.push((Token::Then, line));
-                    characters.next();
+                    characters.next(); /* Using next() because we used peek() before */
                 }
 
                 Some(':') =>
-                /* Assignment */
+                /* Assignment (=:) */
                 {
                     tokens.push((Token::Assignment, line));
-                    characters.next();
+                    characters.next(); /* Using next() because we used peek() before */
                 }
 
                 _ =>
-                /* Equal */
+                /* Equal (=) */
                 {
                     tokens.push((
                         Token::BinaryOP(|a, b| MaeelType::Integer((b == a) as i32)),
@@ -1020,14 +1041,14 @@ fn lex_into_tokens(code: &str) -> Vec<TokenData> {
             {
                 match characters.peek() {
                     Some('>') =>
-                    /* Assignment*/
+                    /* Assignment (->) */
                     {
                         tokens.push((Token::Assignment, line));
                         characters.next();
                     }
 
                     _ =>
-                    /* Minus */
+                    /* Minus (-) */
                     {
                         tokens.push((Token::BinaryOP(|a, b| b - a), line))
                     }
@@ -1050,7 +1071,7 @@ fn lex_into_tokens(code: &str) -> Vec<TokenData> {
                     '.' => Token::Dot,
                     ':' => Token::Colon,
 
-                    character => panic!("{line}: found unknown char: {character}"),
+                    character => emit_error!(line, format!("found unknown char: {character}")),
                 },
                 line,
             )),
