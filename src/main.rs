@@ -10,17 +10,9 @@ use std::process::exit;
 use std::ptr;
 use std::rc::Rc;
 
-type TokenData /* Token Data (token and line) type */ =
-    (Token /* Token */, u16 /* Line */);
-
-type Fun /* Function type */ = (
-    Rc<[TokenData]>, /* (Token, Line)s */
-    bool,            /* Inline descriptor */
-);
-
-type BinApp /* Binary VM application */ =
-    fn(MaeelType /* LHS */, MaeelType /* RHS */) -> MaeelType;
-
+type TokenData /* Token Data (token and line) type */ = (Token, u16);
+type Fun /* Function (token and inline descriptor) type */ = (Rc<[TokenData]>, bool);
+type BinApp /* Binary VM application */ = fn(MaeelType, MaeelType) -> MaeelType;
 type VMOutput<T> /* Default VM function output */ = Result<T, Box<dyn Error>>;
 
 macro_rules! expect_token {
@@ -58,27 +50,13 @@ macro_rules! expect_stack {
         }
     }};
 }
+
 macro_rules! emit_error {
     ($line:expr, $message:expr) => {{
         println!("{}: {}", $line, $message);
         exit(1);
     }};
 }
-/* Build an empty hashmap (1) */
-macro_rules! empty_hashmap {
-    () => {
-        hashbrown::HashMap::default()
-    };
-}
-
-/* Build an empty vec (1) */
-macro_rules! empty_vec {
-    () => {
-        Vec::default()
-    };
-}
-
-/* So we don't need to change every line (future usage of libraries?) */
 
 /* Build a binary operator anonymous function */
 macro_rules! binary_op {
@@ -154,6 +132,7 @@ enum Token {
     ArrayEnd,              /* } */
     BlockStart,            /* ( */
     BlockEnd,              /* ) */
+    MaeelAssignment,       /* Only MaeelVM(rs) can use this */
 }
 
 #[derive(Debug)]
@@ -194,12 +173,14 @@ impl<T> Guitar<T> {
 /* Maeel Stack */
 struct BocchiVM {
     head: *mut Guitar<MaeelType>, /* Raw pointer to the head node */
+    included: Vec<String>,
 }
 
 impl Default for BocchiVM {
     fn default() -> Self {
         BocchiVM {
             head: ptr::null_mut(),
+            included: Vec::default(),
         }
     }
 }
@@ -221,7 +202,7 @@ impl BocchiVM {
         tokens: &mut Vec<TokenData>,
         vars: &mut HashMap<String, MaeelType>,
     ) -> VMOutput<()> {
-        let mut xs /* Array content */ = empty_vec!();
+        let mut xs /* Array content */ = Vec::default();
 
         while let Some(temporary_token_data) = tokens.pop() {
             let (temporary_token, temporary_line) =
@@ -241,15 +222,20 @@ impl BocchiVM {
                     xs.push(self.pop()?);
                 }
 
-                Token::String(_) | Token::Integer(_) | Token::Float(_) | Token::Block(_) => {
+                Token::String(_) | Token::Integer(_) | Token::Float(_) | Token::Block(_) =>
+                {
                     xs.push(temporary_token.into())
                 }
 
-                Token::Identifier(identifier) => match vars.get(&identifier) {
-                    Some(value) => xs.push(value.clone()),
+                Token::Identifier(identifier) =>
+                {
+                    match vars.get(&identifier) {
+                        Some(value) => xs.push(value.clone()),
 
-                    _ => {
-                        emit_error!(temporary_line, format!("unknown identifier found while parsing array: {identifier} (maybe store it inside a variable ?)"))
+                        _ => emit_error!(
+                            temporary_line,
+                            format!("unknown identifier found while parsing array: {identifier} (maybe store it inside a variable ?)")
+                        )
                     }
                 },
 
@@ -295,7 +281,7 @@ impl BocchiVM {
                     self.binary_op(app)?
                 }
 
-                Token::String(_) | Token::Block(_) | Token::Float(_) | Token::Integer(_) => {
+                Token::String(_) | Token::Float(_) | Token::Integer(_) => {
                     self.push(token.into())?
                 }
 
@@ -311,7 +297,7 @@ impl BocchiVM {
                         if fun.1
                         /* Inline function */
                         {
-                            /* We just push f@unctions tokens on
+                            /* We just push functions tokens on
                             the current tokens stack and continue */
                             fun.0.iter().for_each(|token| tokens.push(token.clone()));
                         } else {
@@ -330,14 +316,24 @@ impl BocchiVM {
                     self.push(structure_member.unwrap().clone())?
                 }
 
+                Token::Block(mut block) =>
+                /* Use code blocks as first class objects */
+                {
+                    block.reverse();
+
+                    /* Push the codeblock */
+                    self.push(MaeelType::Function((
+                        block.as_slice().into(), /* Function tokens */
+                        true,                    /* Function inline descriptor */
+                    )))?
+                }
+
                 Token::Colon =>
                 /* Use functions as first class objects */
                 {
-                    /* Function name */
-                    let fun_name = expect_token!(Identifier, tokens, line);
+                    let fun_name /* Function name */ = expect_token!(Identifier, tokens, line);
 
-                    /* Function object */
-                    let fun = funs.get(&fun_name).unwrap_or_else(|| {
+                    let fun /* Function object */ = funs.get(&fun_name).unwrap_or_else(|| {
                         emit_error!(line, format!("unknown function: {fun_name:?}"))
                     });
 
@@ -351,8 +347,7 @@ impl BocchiVM {
                 Token::Call =>
                 /* Manually call a function */
                 {
-                    /* Function object */
-                    let fun = expect_stack!(Function, self, line);
+                    let fun /* Function object */ = expect_stack!(Function, self, line);
 
                     if fun.1
                     /* Inline function */
@@ -385,20 +380,40 @@ impl BocchiVM {
                             Some(temporary_token) => tokens.push(temporary_token),
                             None => emit_error!(line, "expected something after '=>'"),
                         },
+
                         Ok(False!()) => { /* Do nothing */ }
+
                         Ok(other) => emit_error!(
                             line,
                             format!("'=>' expects a boolean (0 or 1) on the stack; got {other:?} instead.")
                         ),
+
                         Err(_) => emit_error!(line, "'=>' expects a boolean (0 or 1) on the stack."),
                     }
+                }
+
+                Token::MaeelAssignment =>
+                /* MaeelType <-> identifier */
+                {
+                    vars.insert(
+                        expect_token!(Identifier, tokens, line), /* Variable name */
+                        self.pop()?,                             /* Variable value */
+                    );
                 }
 
                 Token::Assignment =>
                 /* MaeelType <-> identifier */
                 {
                     let name = expect_token!(Identifier, tokens, line);
-                    vars.insert(name, self.pop()?);
+
+                    if name.starts_with("__") {
+                        panic!()
+                    }
+
+                    vars.insert(
+                        name,        /* Variable name */
+                        self.pop()?, /* Variable value */
+                    );
                 }
 
                 Token::Identifier(identifier) =>
@@ -411,16 +426,6 @@ impl BocchiVM {
                             print!("{}", self.peek()?)
                         }
 
-                        "break" =>
-                        /* Stop processing the tokens
-                        Can be used inside of a function, a for loop etc.
-                        But should only be used inside of loops IMO.
-
-                        TODO: rebuild this */
-                        {
-                            break
-                        }
-
                         "clear" =>
                         /* Process "clear" VM operation */
                         {
@@ -428,53 +433,11 @@ impl BocchiVM {
                                 .unwrap_or_else(|_| emit_error!(line, "failed to clear stack!"))
                         }
 
-                        "drop" =>
-                        /* Process "fastpop" VM operation */
-                        {
-                            self.fastpop().unwrap_or_else(|_| {
-                                emit_error!(line, "failed to drop (need at least 1 element)")
-                            })
-                        }
-
-                        "dup" =>
-                        /* Process "dup" VM operation */
-                        {
-                            self.dup().unwrap_or_else(|_| {
-                                emit_error!(line, "failed to dup (need at least 1 element)")
-                            })
-                        }
-
-                        "swap" =>
-                        /* Process "swap" VM operation */
-                        {
-                            self.swap().unwrap_or_else(|_| {
-                                emit_error!(line, "failed to swap (need at least 2 elements)")
-                            })
-                        }
-
-                        "over" =>
-                        /* Process "over" VM operation */
-                        {
-                            self.over().unwrap_or_else(|_| {
-                                emit_error!(line, "failed to over (need at least 2 elements)")
-                            })
-                        }
-
-                        "rot" =>
-                        /* Process "rotate" VM operation */
-                        {
-                            self.rot().unwrap_or_else(|_| {
-                                emit_error!(line, "failed to rotate (need at least 3 elements)")
-                            })
-                        }
-
                         /* For loop implementation */
                         "for" => {
-                            /* Code block to execute at each iteration */
-                            let temporary_tokens = expect_token!(Block, tokens, line);
+                            let temporary_tokens /* Code block to execute at each iteration */ = expect_token!(Block, tokens, line);
 
-                            /* Determine what to iterate through */
-                            match self.pop() {
+                            match self.pop() /* Determine what to iterate through */ {
                                 Ok(MaeelType::Array(xs)) =>
                                 /* Iterate through an array */
                                 {
@@ -507,39 +470,29 @@ impl BocchiVM {
                                     });
                                 }
 
-                                _ => panic!(),
-                            }
-                        }
+                                other => emit_error!(
+                                    line,
+                                    format!("can't iterate through {other:?}")
+                                )
 
-                        /* While loop implementation */
-                        "while" => {
-                            let temporary_tokens = expect_token!(Block, tokens, line);
-
-                            while expect_stack!(Integer, self, line) == 1 {
-                                self.process_tokens(
-                                    &mut temporary_tokens.clone(),
-                                    vars,
-                                    funs,
-                                    structs,
-                                )?
                             }
                         }
 
                         "struct" => {
-                            let struct_name = expect_token!(Identifier, tokens, line);
-
-                            /* Structure attributes */
-                            let mut struct_fields = empty_vec!();
+                            let struct_name /* Structure name */ = expect_token!(Identifier, tokens, line);
+                            let mut struct_fields /* Structure attributes */ = Vec::default();
 
                             while let Some(temporary_tokens) = tokens.pop() {
                                 match temporary_tokens {
                                     (Token::Dot, _) =>
-                                        /* Stop parsing structure fields on '.' */
+                                    /* Stop parsing structure fields on '.' */
                                     {
                                         break;
                                     }
 
-                                    (Token::Identifier(identifier), _) => {
+                                    (Token::Identifier(identifier), _) =>
+                                    /* New structure attribute */
+                                    {
                                         struct_fields.push(identifier);
                                     }
 
@@ -563,7 +516,7 @@ impl BocchiVM {
                                 fun_name = expect_token!(Identifier, tokens, line);
                             }
 
-                            let mut fun_tokens = empty_vec!(); /* Final tokens */
+                            let mut fun_tokens = Vec::default(); /* Final tokens */
 
                             while let Some(temporary_token) = tokens.pop() {
                                 match temporary_token {
@@ -577,7 +530,7 @@ impl BocchiVM {
 
                                     (Token::Identifier(_), line) => {
                                         fun_tokens.push(temporary_token);
-                                        fun_tokens.push((Token::Assignment, line));
+                                        fun_tokens.push((Token::MaeelAssignment, line));
                                     }
 
                                     (other, other_line) => {
@@ -641,10 +594,30 @@ impl BocchiVM {
                         "include" => {
                             let target = expect_stack!(String, self, line);
 
+                            if self.included.contains(&target) {
+                                continue;
+                            }
+
+                            self.included.push(target.clone());
+
                             let content = match target.as_str() {
                                 /* Standard library is included at compile time. We prefer memory
                                 usage over CPU usage... */
                                 "std" => include_str!("../stdlib/std.maeel").to_string(),
+
+                                "core" => include_str!("../stdlib/core.maeel").to_string(),
+
+                                "logic" => include_str!("../stdlib/logic.maeel").to_string(),
+
+                                "array" => include_str!("../stdlib/array.maeel").to_string(),
+
+                                "fp" => include_str!("../stdlib/fp.maeel").to_string(),
+
+                                "math" => include_str!("../stdlib/math.maeel").to_string(),
+
+                                "string" => include_str!("../stdlib/string.maeel").to_string(),
+
+                                "unix" => include_str!("../stdlib/unix.maeel").to_string(),
 
                                 _ => read_to_string(target).unwrap_or_else(|_| {
                                     emit_error!(line, "failed to include file")
@@ -676,8 +649,7 @@ impl BocchiVM {
                                     continue;
                                 }
 
-                                /* Turn fun tokens into a vec so we can use
-                                reverse() later */
+                                /* Turn fun tokens into a vec so we can use reverse() later */
                                 let mut fun_tokens = fun.0.clone().to_vec();
 
                                 /* ...here lol */
@@ -696,8 +668,7 @@ impl BocchiVM {
                             if let Some(fields) = structs.get(identifier)
                             /* Identifier is a structure */
                             {
-                                /* Future structure */
-                                let mut structure = HashMap::with_capacity(fields.len());
+                                let mut structure /* Future structure */ = HashMap::with_capacity(fields.len());
 
                                 /* Map each field to a value of the stack */
                                 fields.iter().for_each(|key| {
@@ -721,16 +692,15 @@ impl BocchiVM {
     }
 
     fn push(&mut self, value: MaeelType) -> VMOutput<()> {
-        let future_head = Guitar::new(value); /* Create a new node that contains `value` */
+        let future_head /* Create a new node that contains `value` */ = Guitar::new(value);
 
         if !self.head.is_null() {
             unsafe {
-                /* Set head as future_head next node */
-                (*future_head).next = self.head;
+                (*future_head).next /* Set head as future_head next node */ = self.head;
             }
         }
 
-        self.head = future_head; /* Replace head with future_head */
+        self.head /* Replace head with future_head */ = future_head;
 
         Ok(())
     }
@@ -744,25 +714,9 @@ impl BocchiVM {
 
         let current_head = unsafe { Box::from_raw(self.head) };
 
-        /* Replace the current head with her next node */
-        self.head = current_head.next;
+        self.head /* Replace the current head with her next node */ = current_head.next;
 
         Ok(current_head.value)
-    }
-
-    fn fastpop(&mut self) -> VMOutput<()> {
-        if self.head.is_null()
-        /* Making sure the stack contains at least one value */
-        {
-            return Err("Stack is empty".into());
-        }
-
-        let current_head = unsafe { Box::from_raw(self.head) };
-
-        /* Replace the current head with her next node */
-        self.head = current_head.next;
-
-        Ok(())
     }
 
     fn peek(&self) -> VMOutput<&MaeelType> {
@@ -780,69 +734,6 @@ impl BocchiVM {
         /* Dropping all the next_node until head is not null */
         {
             self.head = unsafe { Box::from_raw(self.head) }.next
-        }
-
-        Ok(())
-    }
-
-    fn swap(&mut self) -> VMOutput<()> {
-        if self.head.is_null() || unsafe { (*self.head).next.is_null() }
-        /* Making sure the stack contains at least two values */
-        {
-            return Err("Not enough elements on the stack".into());
-        }
-
-        unsafe {
-            ptr::swap(&mut (*self.head).value, &mut (*(*self.head).next).value);
-        }
-
-        Ok(())
-    }
-
-    fn dup(&mut self) -> VMOutput<()> {
-        if self.head.is_null()
-        /* Making sure the stack contains at least one value */
-        {
-            return Err("Stack is empty".into());
-        }
-
-        self.push(unsafe { (*self.head).value.clone() })
-    }
-
-    fn over(&mut self) -> VMOutput<()> {
-        if self.head.is_null() || unsafe { (*self.head).next.is_null() }
-        /* Making sure the stack contains at least two values */
-        {
-            return Err("Stack has less than two elements".into());
-        }
-
-        self.push(
-            /* Get the value under the stack top */
-            unsafe { (*(*self.head).next).value.clone() },
-        )
-    }
-
-    fn rot(&mut self) -> VMOutput<()> {
-        if self.head.is_null()
-            || unsafe { (*self.head).next.is_null() }
-            || unsafe { (*(*self.head).next).next.is_null() }
-        /* Making sure the stack contains at least three values */
-        {
-            return Err("Stack has less than three elements".into());
-        }
-
-        unsafe {
-            let top = &mut *self.head;
-            let mid = &mut *(*self.head).next;
-            let bot = &mut *(*(*self.head).next).next;
-
-            /* Store the top value in a temp variable,
-            as we update its value first */
-            let temp = ptr::read(&top.value);
-
-            ptr::swap /* V(top) <- V(mid) */ (&mut top.value, &mut mid.value);
-            ptr::swap /* V(mid) <- V(bot) */ (&mut mid.value, &mut bot.value);
-            ptr::write /* V(bot) <- V(top) */ (&mut bot.value, temp);
         }
 
         Ok(())
@@ -903,13 +794,14 @@ impl std::fmt::Display for MaeelType {
 fn lex_into_tokens(code: &str) -> Vec<TokenData> {
     let mut depth = 0;
     let mut line = 1;
-    let mut tokens = empty_vec!();
+    let mut tokens = Vec::default();
     let mut characters = code.chars().peekable();
 
     while let Some(character) = characters.next() {
         match character {
+            '|' =>
             /* Parse comments */
-            '|' => {
+            {
                 for character in characters.by_ref() {
                     if character == '\n'
                     /* Comment ends at end-of-line */
@@ -921,23 +813,29 @@ fn lex_into_tokens(code: &str) -> Vec<TokenData> {
 
             '\n' => line += 1,
 
+            ' ' | '\t' =>
             /* Ignore whitespaces */
-            ' ' | '\t' => continue,
+            {
+                continue
+            }
 
+            '(' =>
             /* Code block start */
-            '(' => {
+            {
                 tokens.push((Token::BlockStart, line));
                 depth += 1;
             }
 
+            ')' =>
             /* Code block end */
-            ')' => {
+            {
                 tokens.push((Token::BlockEnd, line));
                 depth -= 1;
             }
 
+            '"' =>
             /* Parse strings */
-            '"' => {
+            {
                 let content_vector = characters
                     .by_ref()
                     .take_while(|&character| character != '"')
@@ -982,16 +880,20 @@ fn lex_into_tokens(code: &str) -> Vec<TokenData> {
                 tokens.push((Token::String(content), line))
             }
 
+            'a'..='z' | 'A'..='Z' | '_' =>
             /* Parse identifiers */
-            'a'..='z' | 'A'..='Z' | '_' => tokens.push((
-                Token::Identifier(take_with_predicate!(character, characters, |&character| {
-                    character.is_alphanumeric() || character == '_'
-                })),
-                line,
-            )),
+            {
+                tokens.push((
+                    Token::Identifier(take_with_predicate!(character, characters, |&character| {
+                        character.is_alphanumeric() || character == '_'
+                    })),
+                    line,
+                ))
+            }
 
+            '0'..='9' =>
             /* Parse numerics (float/integers) */
-            '0'..='9' => {
+            {
                 let content = take_with_predicate!(character, characters, |&character| {
                     character.is_ascii_digit() || character == '.' || character == '_'
                 });
@@ -1008,9 +910,8 @@ fn lex_into_tokens(code: &str) -> Vec<TokenData> {
                 ));
             }
 
-            /* Parse equal/then */
             '=' => match characters.peek()
-            /* Just using peek() because of the _ case */
+            /* Parse equal/then, Just using peek() because of the _ case */
             {
                 Some('>') =>
                 /* Then (=>) */
@@ -1080,17 +981,15 @@ fn lex_into_tokens(code: &str) -> Vec<TokenData> {
 
     assert_eq!(depth, 0);
 
-    let mut stack = empty_vec!();
-    let mut output = empty_vec!();
-    let mut temporary_tokens = empty_vec!();
+    let mut stack = Vec::default();
+    let mut output = Vec::default();
+    let mut temporary_tokens = Vec::default();
 
     for token in tokens.iter() {
         match token {
             (Token::BlockStart, _) => {
                 stack.push(temporary_tokens);
-
-                /* Clear the temporary tokens */
-                temporary_tokens = empty_vec!();
+                temporary_tokens /* Clear the temporary tokens */ = Vec::default();
             }
 
             (Token::BlockEnd, _) => {
@@ -1209,7 +1108,6 @@ impl std::ops::Rem for MaeelType {
             (Self::Float(x), Self::Float(y)) => Self::Float(x % y),
             (Self::Integer(m), Self::Float(x)) => Self::Float(m as f32 % x),
             (Self::Float(x), Self::Integer(m)) => Self::Float(x % m as f32),
-
             (a, b) => panic!("Cannot divide {a} and {b}"),
         }
     }
@@ -1224,7 +1122,6 @@ impl std::ops::Div for MaeelType {
             (Self::Float(x), Self::Float(y)) => Self::Float(x / y),
             (Self::Integer(m), Self::Float(x)) => Self::Float(m as f32 / x),
             (Self::Float(x), Self::Integer(m)) => Self::Float(x / m as f32),
-
             (a, b) => panic!("Cannot divide {a} and {b}"),
         }
     }
@@ -1245,8 +1142,8 @@ impl From<Token> for MaeelType {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     BocchiVM::default().process_tokens(
         &mut lex_into_tokens(&read_to_string(args().nth(1).unwrap())?),
-        &mut empty_hashmap!(),
-        &mut empty_hashmap!(),
-        &mut empty_hashmap!(),
+        &mut HashMap::default(),
+        &mut HashMap::default(),
+        &mut HashMap::default(),
     )
 }
